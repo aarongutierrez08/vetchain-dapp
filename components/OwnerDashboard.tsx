@@ -1,10 +1,10 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useCallback } from "react";
 import { Contract } from "ethers";
 import { Button } from "./Button";
-import { Input } from "./Input";
+import { SmartAddressInput } from "./SmartAddressInput";
 import { Animal } from "../types";
+import { MedicalHistoryTable } from "./MedicalHistoryTable";
 
-// --- Helper para IPFS ---
 const resolveIPFS = (url: string | undefined): string => {
   if (!url) return "";
   if (url.startsWith("ipfs://")) {
@@ -13,10 +13,11 @@ const resolveIPFS = (url: string | undefined): string => {
   return url;
 };
 
-// --- Interfaces ---
 interface OwnerDashboardProps {
   nftContract: Contract | null;
+  storageContract: Contract | null;
   account: string;
+  onBack: () => void;
 }
 
 interface PetMetadata {
@@ -25,69 +26,102 @@ interface PetMetadata {
   image: string;
 }
 
-// --- Sub-componente: Tarjeta Individual de Mascota ---
-// Maneja su propio fetch de metadatos y estados de input para acciones
 const PetCard: React.FC<{
   pet: Animal;
   nftContract: Contract;
+  storageContract: Contract | null;
   account: string;
   onRemove: (id: string) => void;
   onUpdateLostStatus: (id: string, status: boolean) => void;
-}> = ({ pet, nftContract, account, onRemove, onUpdateLostStatus }) => {
-  // Estado de Metadatos
+}> = ({
+  pet,
+  nftContract,
+  storageContract,
+  account,
+  onRemove,
+  onUpdateLostStatus,
+}) => {
   const [metadata, setMetadata] = useState<PetMetadata | null>(null);
   const [loadingMeta, setLoadingMeta] = useState(true);
+  const [isDeceased, setIsDeceased] = useState(false);
 
-  // Estado de Acciones
-  const [approveAddr, setApproveAddr] = useState("");
-  const [transferAddr, setTransferAddr] = useState("");
+  // Smart Input States
+  const [approveInput, setApproveInput] = useState("");
+  const [approveAddr, setApproveAddr] = useState<string | null>(null);
+
+  const [transferInput, setTransferInput] = useState("");
+  const [transferAddr, setTransferAddr] = useState<string | null>(null);
+
   const [actionLoading, setActionLoading] = useState<string | null>(null);
 
-  // 1. Fetch de Metadatos (JSON desde IPFS)
+  // History Modal State
+  const [showHistory, setShowHistory] = useState(false);
+
+  // Fetch Metadata & Deceased Status
   useEffect(() => {
-    const fetchMetadata = async () => {
+    let isMounted = true;
+    const loadData = async () => {
       try {
         setLoadingMeta(true);
+        // Metadata
         const gatewayUrl = resolveIPFS(pet.uri);
-
         const response = await fetch(gatewayUrl);
         if (!response.ok) throw new Error("Fetch failed");
 
         const json = await response.json();
 
-        // Procesar la imagen que viene dentro del JSON (puede ser ipfs:// también)
-        const resolvedImage = resolveIPFS(json.image);
+        // Deceased Check: Query storage history
+        let dead = false;
+        if (storageContract) {
+          const filter = storageContract.filters.MedicalRecordAdded(
+            pet.tokenId
+          );
+          const events = await storageContract.queryFilter(filter);
+          if (events.length > 0) {
+            const latestEvent: any = events.sort(
+              (a: any, b: any) => Number(b.args[1]) - Number(a.args[1])
+            )[0];
+            if (Number(latestEvent.args[4]) === 4) dead = true;
+          }
+        }
 
-        setMetadata({
-          name: json.name || "Sin Nombre",
-          description: json.description,
-          image: resolvedImage,
-        });
+        if (isMounted) {
+          setMetadata({
+            name: json.name || "Sin Nombre",
+            description: json.description,
+            image: resolveIPFS(json.image),
+          });
+          setIsDeceased(dead);
+        }
       } catch (error) {
-        console.error("Error loading metadata for", pet.tokenId, error);
-        setMetadata({
-          name: `Mascota #${pet.tokenId}`,
-          image: "https://placehold.co/400x300?text=No+Metadata",
-        });
+        if (isMounted) {
+          setMetadata({
+            name: `Chip #${pet.tokenId}`,
+            image: "https://placehold.co/400x300?text=No+Metadata",
+          });
+        }
       } finally {
-        setLoadingMeta(false);
+        if (isMounted) setLoadingMeta(false);
       }
     };
+    if (pet.uri) loadData();
+    return () => {
+      isMounted = false;
+    };
+  }, [pet.uri, pet.tokenId, storageContract]);
 
-    if (pet.uri) {
-      fetchMetadata();
-    }
-  }, [pet.uri, pet.tokenId]);
-
-  // 2. Acciones del Smart Contract
   const handleApproveVet = async () => {
-    if (!approveAddr) return;
+    if (!approveAddr) {
+      alert("Dirección de Veterinario inválida.");
+      return;
+    }
     setActionLoading("approving");
     try {
       const tx = await nftContract.approveVet(approveAddr, pet.tokenId);
       await tx.wait();
-      alert(`Vet ${approveAddr} aprobado para ${metadata?.name}`);
-      setApproveAddr("");
+      alert(`Vet ${approveAddr} aprobado.`);
+      setApproveInput("");
+      setApproveAddr(null);
     } catch (error: any) {
       alert(`Error: ${error.reason || error.message}`);
     } finally {
@@ -96,16 +130,19 @@ const PetCard: React.FC<{
   };
 
   const handleTransfer = async () => {
-    if (!transferAddr) return;
+    if (!transferAddr) {
+      alert("Dirección de destino inválida.");
+      return;
+    }
     setActionLoading("transferring");
     try {
-      const tx = await nftContract.transferFrom(
+      const tx = await nftContract.safeTransferFrom(
         account,
         transferAddr,
         pet.tokenId
       );
       await tx.wait();
-      alert(`${metadata?.name} transferido a ${transferAddr}`);
+      alert(`Mascota transferida.`);
       onRemove(pet.tokenId);
     } catch (error: any) {
       alert(`Error: ${error.reason || error.message}`);
@@ -127,284 +164,287 @@ const PetCard: React.FC<{
     }
   };
 
+  const getBorderClass = () => {
+    if (isDeceased) return "border-zinc-600 shadow-xl bg-zinc-900";
+    if (pet.isLost) return "border-red-500 shadow-red-900/20";
+    return "border-slate-700";
+  };
+
   return (
-    <div
-      className={`bg-slate-800 rounded-xl overflow-hidden border shadow-md flex flex-col transition-all ${
-        pet.isLost ? "border-red-500 shadow-red-900/20" : "border-slate-700"
-      }`}
-    >
-      {/* Sección de Imagen */}
-      <div className="h-48 bg-slate-900 w-full relative group">
-        {loadingMeta ? (
-          <div className="w-full h-full flex items-center justify-center bg-slate-800 animate-pulse">
-            <span className="text-slate-500 text-sm">Cargando IPFS...</span>
-          </div>
-        ) : (
-          <img
-            src={metadata?.image}
-            alt={metadata?.name}
-            className={`w-full h-full object-cover transition-opacity ${
-              pet.isLost
-                ? "opacity-50 grayscale"
-                : "opacity-90 group-hover:opacity-100"
-            }`}
-            onError={(e) => {
-              (e.target as HTMLImageElement).src =
-                "https://placehold.co/400x300?text=Error+Imagen";
-            }}
-          />
-        )}
-
-        <div className="absolute top-2 right-2 bg-black/70 text-white px-3 py-1 rounded-full text-xs font-mono border border-slate-600 backdrop-blur-sm">
-          ID: {pet.tokenId}
-        </div>
-
-        {pet.isLost && (
-          <div className="absolute inset-0 flex items-center justify-center z-10 pointer-events-none">
-            <span className="bg-red-600/90 text-white font-black text-xl px-6 py-2 rounded border-2 border-white transform -rotate-12 shadow-xl backdrop-blur-sm">
-              ⚠️ PERDIDO
-            </span>
-          </div>
-        )}
-      </div>
-
-      {/* Sección de Contenido */}
-      <div className="p-4 flex-1 flex flex-col gap-4">
-        <div>
+    <>
+      <div
+        className={`bg-slate-800 rounded-xl overflow-hidden border shadow-md flex flex-col transition-all ${getBorderClass()}`}
+      >
+        <div className="h-48 bg-slate-900 w-full relative group">
           {loadingMeta ? (
-            <div className="h-6 bg-slate-700 rounded w-3/4 animate-pulse mb-2"></div>
+            <div className="w-full h-full flex items-center justify-center bg-slate-800 animate-pulse">
+              <span className="text-slate-500 text-sm">Cargando...</span>
+            </div>
           ) : (
-            <h3
-              className="text-xl font-bold text-white truncate"
-              title={metadata?.name}
-            >
-              {metadata?.name}
-            </h3>
+            <img
+              src={metadata?.image}
+              alt={metadata?.name}
+              className={`w-full h-full object-cover ${
+                pet.isLost ? "grayscale opacity-50" : ""
+              } ${isDeceased ? "grayscale contrast-125" : ""}`}
+            />
           )}
-          <a
-            href={resolveIPFS(pet.uri)}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="text-xs text-secondary hover:underline flex items-center gap-1"
-          >
-            📄 Ver JSON Metadatos
-          </a>
-        </div>
-
-        {/* Botón de Estado Perdido */}
-        <Button
-          variant={pet.isLost ? "success" : "danger"}
-          className="w-full text-sm py-1"
-          isLoading={actionLoading === "toggling_lost"}
-          onClick={handleToggleLost}
-        >
-          {pet.isLost ? "🔍 Marcar como Encontrado" : "⚠️ Reportar Perdido"}
-        </Button>
-
-        <hr className="border-slate-700" />
-
-        {/* Approve Vet Action */}
-        <div className="bg-slate-900/50 p-3 rounded-lg space-y-2 border border-slate-700/50">
-          <label className="text-xs font-bold text-secondary uppercase tracking-wider flex items-center gap-1">
-            <span>🏥</span> Autorizar Vet
-          </label>
-          <div className="flex gap-2">
-            <input
-              className="bg-slate-800 text-white text-xs p-2 rounded w-full border border-slate-700 focus:border-secondary outline-none transition-colors"
-              placeholder="Address Vet (0x...)"
-              value={approveAddr}
-              onChange={(e) => setApproveAddr(e.target.value)}
-            />
-            <Button
-              variant="secondary"
-              className="!px-3 !py-1 text-xs whitespace-nowrap"
-              isLoading={actionLoading === "approving"}
-              onClick={handleApproveVet}
-            >
-              Aprobar
-            </Button>
+          <div className="absolute top-2 right-2 bg-black/70 text-white px-3 py-1 rounded-full text-xs font-mono border border-slate-600">
+            ID: {pet.tokenId}
           </div>
+          {pet.isLost && !isDeceased && (
+            <div className="absolute inset-0 flex items-center justify-center">
+              <span className="bg-red-600/90 text-white font-black text-xl px-4 py-1 rounded border-2 border-white -rotate-12 shadow-xl">
+                ¡PERDIDO!
+              </span>
+            </div>
+          )}
+          {isDeceased && (
+            <div className="absolute inset-0 flex items-center justify-center bg-black/50">
+              <span className="bg-black text-white font-black text-xl px-4 py-2 border-y-4 border-zinc-500">
+                ⚰️ FALLECIDO
+              </span>
+            </div>
+          )}
         </div>
 
-        {/* Transfer Action */}
-        <div className="bg-slate-900/50 p-3 rounded-lg space-y-2 mt-auto border border-slate-700/50">
-          <label className="text-xs font-bold text-accent uppercase tracking-wider flex items-center gap-1">
-            <span>🔁</span> Transferir
-          </label>
-          <div className="flex gap-2">
-            <input
-              className="bg-slate-800 text-white text-xs p-2 rounded w-full border border-slate-700 focus:border-accent outline-none transition-colors"
-              placeholder="Nuevo Dueño (0x...)"
-              value={transferAddr}
-              onChange={(e) => setTransferAddr(e.target.value)}
-            />
-            <Button
-              variant="danger"
-              className="!px-3 !py-1 text-xs whitespace-nowrap"
-              isLoading={actionLoading === "transferring"}
-              onClick={handleTransfer}
-            >
-              Enviar
-            </Button>
+        <div className="p-4 flex-1 flex flex-col gap-4">
+          <div>
+            <div className="flex justify-between items-start">
+              <h3 className="text-xl font-bold text-white truncate">
+                {metadata?.name}
+              </h3>
+              <button
+                onClick={() => setShowHistory(true)}
+                className="text-xs bg-indigo-500/20 text-indigo-300 px-2 py-1 rounded hover:bg-indigo-500/30 transition-colors"
+              >
+                📜 Historial
+              </button>
+            </div>
+            <p className="text-xs text-slate-400 truncate mt-1">
+              {metadata?.description}
+            </p>
+          </div>
+
+          <Button
+            variant={pet.isLost ? "success" : "danger"}
+            className="w-full text-sm py-1"
+            isLoading={actionLoading === "toggling_lost"}
+            onClick={handleToggleLost}
+            disabled={isDeceased}
+          >
+            {pet.isLost ? "¡Encontrado!" : "Reportar Perdido"}
+          </Button>
+
+          <div
+            className={`bg-slate-900/50 p-3 rounded-lg space-y-2 border border-slate-700/50 ${
+              isDeceased ? "opacity-50 pointer-events-none" : ""
+            }`}
+          >
+            <label className="text-xs font-bold text-secondary uppercase">
+              Autorizar Vet
+            </label>
+            <div className="flex flex-col gap-2">
+              <SmartAddressInput
+                value={approveInput}
+                onChange={setApproveInput}
+                onAddressResolved={setApproveAddr}
+                placeholder="Email o 0x..."
+              />
+              <Button
+                onClick={handleApproveVet}
+                disabled={!approveAddr}
+                isLoading={actionLoading === "approving"}
+                variant="secondary"
+                className="w-full text-xs h-[32px]"
+              >
+                Confirmar
+              </Button>
+            </div>
+          </div>
+
+          <div
+            className={`bg-slate-900/50 p-3 rounded-lg space-y-2 mt-auto border border-slate-700/50 ${
+              isDeceased ? "opacity-50 pointer-events-none" : ""
+            }`}
+          >
+            <label className="text-xs font-bold text-accent uppercase">
+              Transferir
+            </label>
+            <div className="flex flex-col gap-2">
+              <SmartAddressInput
+                value={transferInput}
+                onChange={setTransferInput}
+                onAddressResolved={setTransferAddr}
+                placeholder="Email o 0x..."
+              />
+              <Button
+                onClick={handleTransfer}
+                disabled={!transferAddr}
+                isLoading={actionLoading === "transferring"}
+                variant="danger"
+                className="w-full text-xs h-[32px]"
+              >
+                Transferir
+              </Button>
+            </div>
           </div>
         </div>
       </div>
-    </div>
+
+      {/* Medical History Modal */}
+      {showHistory && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4 animate-fade-in">
+          <div className="bg-slate-900 border border-slate-700 rounded-xl w-full max-w-3xl max-h-[90vh] flex flex-col shadow-2xl">
+            <div className="p-4 border-b border-slate-700 flex justify-between items-center">
+              <h3 className="text-xl font-bold text-white">
+                📑 Historia Clínica: {metadata?.name}
+              </h3>
+              <button
+                onClick={() => setShowHistory(false)}
+                className="text-slate-400 hover:text-white text-2xl leading-none"
+              >
+                &times;
+              </button>
+            </div>
+            <div className="flex-1 overflow-y-auto p-4 custom-scrollbar">
+              <MedicalHistoryTable
+                tokenId={pet.tokenId}
+                storageContract={storageContract}
+              />
+            </div>
+            <div className="p-4 border-t border-slate-700 bg-slate-800/50 rounded-b-xl">
+              <Button
+                onClick={() => setShowHistory(false)}
+                variant="secondary"
+                className="w-full"
+              >
+                Cerrar
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
   );
 };
 
-// --- Componente Principal ---
 export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({
   nftContract,
+  storageContract,
   account,
+  onBack,
 }) => {
   const [pets, setPets] = useState<Animal[]>([]);
-  const [searchChipId, setSearchChipId] = useState("");
-  const [isSearching, setIsSearching] = useState(false);
-  const [statusMsg, setStatusMsg] = useState<{
-    type: "error" | "success";
-    text: string;
-  } | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
 
-  const handleAddPet = async () => {
-    if (!nftContract || !account || !searchChipId) return;
-
-    if (pets.some((p) => p.tokenId === searchChipId)) {
-      setStatusMsg({
-        type: "error",
-        text: "Esta mascota ya está en tu panel.",
-      });
-      return;
-    }
-
-    setIsSearching(true);
-    setStatusMsg(null);
-
+  const fetchMyPets = useCallback(async () => {
+    if (!nftContract || !account) return;
+    setIsLoading(true);
     try {
-      const ownerAddress = await nftContract.ownerOf(searchChipId);
+      // 1. Get all Transfer events where 'to' is current account
+      const filter = nftContract.filters.Transfer(undefined, account);
+      const events = await nftContract.queryFilter(filter);
 
-      if (ownerAddress.toLowerCase() !== account.toLowerCase()) {
-        setStatusMsg({
-          type: "error",
-          text: "No eres el dueño de este ID de Chip.",
-        });
-        return;
-      }
-
-      const uri = await nftContract.tokenURI(searchChipId);
-      const isLost = await nftContract.isLost(searchChipId);
-
-      setPets((prev) => [...prev, { tokenId: searchChipId, uri, isLost }]);
-      setStatusMsg({
-        type: "success",
-        text: `¡Mascota #${searchChipId} agregada con éxito!`,
+      // 2. Extract unique token IDs
+      const candidateIds = new Set<string>();
+      events.forEach((event: any) => {
+        if (event.args && event.args[2]) {
+          candidateIds.add(event.args[2].toString());
+        }
       });
-      setSearchChipId("");
-    } catch (error: any) {
-      console.error("Error finding pet:", error);
-      if (error.reason && error.reason.includes("ERC721NonexistentToken")) {
-        setStatusMsg({
-          type: "error",
-          text: "El ID de Chip no existe en la cadena.",
-        });
-      } else {
-        setStatusMsg({
-          type: "error",
-          text: "Error al buscar mascota. Revisa el ID o la consola.",
-        });
+
+      // 3. Verify current ownership
+      const validPets: Animal[] = [];
+
+      for (const tokenId of candidateIds) {
+        try {
+          const currentOwner = await nftContract.ownerOf(tokenId);
+          if (currentOwner.toLowerCase() === account.toLowerCase()) {
+            const uri = await nftContract.tokenURI(tokenId);
+            const isLost = await nftContract.isLost(tokenId);
+            validPets.push({ tokenId, uri, isLost });
+          }
+        } catch (err) {
+          console.warn(`Could not verify ownership of ${tokenId}`, err);
+        }
       }
+
+      setPets(validPets);
+    } catch (error) {
+      console.error("Error auto-fetching pets:", error);
+      alert("Error cargando mascotas desde la blockchain.");
     } finally {
-      setIsSearching(false);
+      setIsLoading(false);
     }
-  };
+  }, [nftContract, account]);
 
-  const removePet = (id: string) => {
-    setPets((prev) => prev.filter((p) => p.tokenId !== id));
-  };
-
-  const updateLostStatus = (id: string, status: boolean) => {
-    setPets((prev) =>
-      prev.map((p) => (p.tokenId === id ? { ...p, isLost: status } : p))
-    );
-  };
+  useEffect(() => {
+    fetchMyPets();
+  }, [fetchMyPets]);
 
   return (
-    <div className="space-y-8">
-      {/* Introduction Banner */}
-      <div className="bg-gradient-to-r from-slate-800 to-slate-900 p-6 rounded-xl shadow-lg border border-slate-700">
-        <h2 className="text-2xl font-bold mb-2 text-white">
-          🐾 Panel de Mis Mascotas
-        </h2>
-        <p className="text-slate-400">
-          Gestiona tus mascotas registradas. Ingresa el{" "}
-          <strong>ID de Chip</strong> proporcionado por tu veterinario para
-          cargar el perfil desde IPFS.
-        </p>
+    <div className="space-y-8 animate-fade-in">
+      {/* Back Button */}
+      <button
+        onClick={onBack}
+        className="flex items-center gap-2 text-slate-400 hover:text-white transition-colors"
+      >
+        <span>⬅</span> Volver al Menú
+      </button>
+
+      <div className="flex justify-between items-center">
+        <h2 className="text-2xl font-bold text-white">Mis Mascotas</h2>
+        <Button
+          onClick={() => fetchMyPets()}
+          variant="secondary"
+          className="!py-1 !text-sm"
+        >
+          Refrescar Lista
+        </Button>
       </div>
 
-      {/* Import Pet Section */}
-      <div className="bg-surface p-6 rounded-xl shadow-lg border border-slate-700">
-        <h3 className="text-lg font-bold text-white mb-4">Buscar mi Mascota</h3>
-        <div className="flex flex-col md:flex-row gap-4 items-end">
-          <div className="flex-1 w-full">
-            <Input
-              label="Ingresar ID de Chip (Token ID)"
-              placeholder="ej. 1001"
-              value={searchChipId}
-              onChange={(e) => setSearchChipId(e.target.value)}
-              type="number"
-            />
-          </div>
-          <Button
-            onClick={handleAddPet}
-            isLoading={isSearching}
-            className="w-full md:w-auto"
-          >
-            Agregar al Panel
-          </Button>
+      {isLoading ? (
+        <div className="text-center py-20">
+          <div className="inline-block animate-spin rounded-full h-8 w-8 border-b-2 border-primary mb-2"></div>
+          <p className="text-slate-400">
+            Escaneando blockchain en busca de tus mascotas...
+          </p>
         </div>
-        {statusMsg && (
-          <div
-            className={`mt-4 p-3 rounded text-sm ${
-              statusMsg.type === "error"
-                ? "bg-red-500/20 text-red-200"
-                : "bg-green-500/20 text-green-200"
-            }`}
-          >
-            {statusMsg.text}
-          </div>
-        )}
-      </div>
-
-      {/* Pet Grid */}
-      <div>
-        <h2 className="text-xl font-bold text-white mb-4">
-          Tu Panel ({pets.length})
-        </h2>
-
-        {pets.length === 0 ? (
-          <div className="text-center py-16 bg-slate-900/50 rounded-xl border border-slate-800 text-slate-400">
-            <div className="text-4xl mb-4">🐕</div>
-            <p className="text-lg">No hay mascotas cargadas aún.</p>
-            <p className="text-sm mt-2">
-              Ingresa tu ID de Chip arriba para ver tu mascota.
-            </p>
-          </div>
-        ) : (
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-            {pets.map((pet) => (
-              <PetCard
-                key={pet.tokenId}
-                pet={pet}
-                nftContract={nftContract!}
-                account={account}
-                onRemove={removePet}
-                onUpdateLostStatus={updateLostStatus}
-              />
-            ))}
-          </div>
-        )}
-      </div>
+      ) : (
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+          {pets.map((pet) => (
+            <PetCard
+              key={pet.tokenId}
+              pet={pet}
+              nftContract={nftContract!}
+              storageContract={storageContract}
+              account={account}
+              onRemove={(id) =>
+                setPets((p) => p.filter((x) => x.tokenId !== id))
+              }
+              onUpdateLostStatus={(id, status) =>
+                setPets((p) =>
+                  p.map((x) =>
+                    x.tokenId === id ? { ...x, isLost: status } : x
+                  )
+                )
+              }
+            />
+          ))}
+          {pets.length === 0 && (
+            <div className="col-span-full text-center py-12 bg-slate-900/50 rounded-xl border border-dashed border-slate-700">
+              <span className="text-4xl block mb-4">🐕</span>
+              <p className="text-slate-400 text-lg">
+                No se encontraron mascotas asociadas a tu cuenta.
+              </p>
+              <p className="text-slate-500 text-sm mt-2">
+                Si acabas de recibir una, espera unos segundos y refresca.
+              </p>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 };

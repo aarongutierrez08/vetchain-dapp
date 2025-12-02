@@ -1,371 +1,454 @@
 import React, { useState } from "react";
 import { Contract } from "ethers";
 import { Input } from "./Input";
+import { SmartAddressInput } from "./SmartAddressInput";
 import { Button } from "./Button";
-import { MedicalRecord } from "../types";
+import { MedicalHistoryTable } from "./MedicalHistoryTable";
+import { uploadFileToIPFS, uploadJSONToIPFS } from "../services/pinataService";
+
+const resolveIPFS = (url: string | undefined): string => {
+  if (!url) return "";
+  if (url.startsWith("ipfs://")) {
+    return url.replace("ipfs://", "https://gateway.pinata.cloud/ipfs/");
+  }
+  return url;
+};
 
 interface VetDashboardProps {
   nftContract: Contract | null;
   storageContract: Contract | null;
+  account: string;
+  onBack: () => void;
 }
 
-// Mapping for UI display based on Contract Enum
-const RECORD_TYPES: { [key: number]: string } = {
-  0: "General",
-  1: "Vacuna",
-  2: "Cirugía",
-  3: "Rayos X",
-};
+interface PatientMetadata {
+  name: string;
+  image: string;
+  description: string;
+}
 
 export const VetDashboard: React.FC<VetDashboardProps> = ({
   nftContract,
   storageContract,
+  account,
+  onBack,
 }) => {
-  // Search State
-  const [searchTokenId, setSearchTokenId] = useState("");
-  const [activeTokenId, setActiveTokenId] = useState<string | null>(null);
-  const [history, setHistory] = useState<MedicalRecord[]>([]);
-  const [loadingHistory, setLoadingHistory] = useState(false);
-
-  // Medical Record Form State (v2.0)
-  const [desc, setDesc] = useState("");
-  const [recordType, setRecordType] = useState<number>(0); // Default General
-  const [daysValid, setDaysValid] = useState<number>(0); // Default 0
-  const [isAdding, setIsAdding] = useState(false);
-  const [recordStatus, setRecordStatus] = useState<string | null>(null);
-
-  // Register Animal Form State (v2.0)
-  const [regOwner, setRegOwner] = useState("");
+  // --- Registration State ---
+  const [regOwnerInput, setRegOwnerInput] = useState("");
+  const [regOwnerAddress, setRegOwnerAddress] = useState<string | null>(null);
   const [regChipId, setRegChipId] = useState("");
-  const [regUri, setRegUri] = useState("");
-  const [regBirthDate, setRegBirthDate] = useState(""); // Date Input String
+  const [regName, setRegName] = useState("");
+  const [regBirthDate, setRegBirthDate] = useState("");
+  const [regImageFile, setRegImageFile] = useState<File | null>(null);
   const [isRegistering, setIsRegistering] = useState(false);
   const [regStatus, setRegStatus] = useState<string | null>(null);
 
-  // --- Registration Logic ---
+  // --- Patient Search & Treatment State ---
+  const [searchChipId, setSearchChipId] = useState("");
+  const [searching, setSearching] = useState(false);
+  const [foundPatientId, setFoundPatientId] = useState<string | null>(null);
+  const [patientMetadata, setPatientMetadata] =
+    useState<PatientMetadata | null>(null);
+  const [isDeceased, setIsDeceased] = useState(false); // New Security Check
+
+  // --- Add Record State ---
+  const [desc, setDesc] = useState("");
+  const [recordType, setRecordType] = useState<number>(0);
+  const [daysValid, setDaysValid] = useState<number>(0);
+  const [isAdding, setIsAdding] = useState(false);
+  const [recordStatus, setRecordStatus] = useState<string | null>(null);
+
+  // --- Logic: Register ---
   const handleRegisterAnimal = async () => {
     if (!nftContract) return;
-    if (!regOwner || !regChipId || !regUri || !regBirthDate) {
-      alert(
-        "Por favor completa todos los campos, incluyendo la fecha de nacimiento."
-      );
+    if (
+      !regOwnerAddress ||
+      !regChipId ||
+      !regName ||
+      !regBirthDate ||
+      !regImageFile
+    ) {
+      alert("Por favor completa todos los campos.");
       return;
     }
 
     setIsRegistering(true);
-    setRegStatus(null);
+    setRegStatus("Iniciando subida a IPFS...");
+
     try {
-      // Convert Date String to Unix Timestamp (Seconds)
+      const imageCid = await uploadFileToIPFS(regImageFile);
+      setRegStatus("Imagen subida. Creando metadatos...");
+
+      const metadata = {
+        name: regName,
+        description: `Mascota registrada con Chip ID: ${regChipId}`,
+        image: `ipfs://${imageCid}`,
+        attributes: [
+          { trait_type: "Birth Date", value: regBirthDate },
+          { trait_type: "Chip ID", value: regChipId },
+        ],
+      };
+
+      const metadataCid = await uploadJSONToIPFS(metadata);
+      const tokenUri = `ipfs://${metadataCid}`;
+
+      setRegStatus("Metadatos listos. Confirmando transacción...");
+
       const birthDateTimestamp = Math.floor(
         new Date(regBirthDate).getTime() / 1000
       );
 
-      // Calls: function registerAnimal(address _toOwner, uint256 _chipId, string memory _uri, uint256 _birthDate)
       const tx = await nftContract.registerAnimal(
-        regOwner,
+        regOwnerAddress,
         regChipId,
-        regUri,
+        tokenUri,
         birthDateTimestamp
       );
-      setRegStatus(`Procesando Registro: ${tx.hash}...`);
-      await tx.wait();
-      setRegStatus(
-        `¡Éxito! Animal Chip #${regChipId} registrado a ${regOwner}`
-      );
+      setRegStatus(`Transacción enviada: ${tx.hash}...`);
 
-      // Clear form
-      setRegOwner("");
+      await tx.wait();
+      setRegStatus(`¡Éxito! Mascota registrada.`);
+
+      // Clear
+      setRegOwnerInput("");
+      setRegOwnerAddress(null);
       setRegChipId("");
-      setRegUri("");
+      setRegName("");
       setRegBirthDate("");
+      setRegImageFile(null);
     } catch (error: any) {
       console.error(error);
-      setRegStatus(
-        `Error: ${
-          error.reason ||
-          error.message ||
-          "Asegúrate de ser un veterinario autorizado."
-        }`
-      );
+      setRegStatus(`Error: ${error.reason || error.message}`);
     } finally {
       setIsRegistering(false);
     }
   };
 
-  // --- History Logic ---
-  const fetchHistory = async (id: string) => {
-    if (!storageContract) return;
-    setLoadingHistory(true);
-    setHistory([]);
+  // --- Logic: Search Patient ---
+  const handleSearchPatient = async () => {
+    if (!nftContract || !searchChipId || !storageContract) return;
+    setSearching(true);
+    setFoundPatientId(null);
+    setPatientMetadata(null);
+    setRecordStatus(null);
+    setIsDeceased(false);
+
     try {
-      const data = await storageContract.getHistory(id);
+      // 1. Verify existence via ownerOf (reverts if nonexistent)
+      await nftContract.ownerOf(searchChipId);
 
-      const formattedHistory: MedicalRecord[] = data.map((item: any) => ({
-        timestamp: item.timestamp,
-        description: item.description,
-        vetAddress: item.vetAddress,
-        recordType: Number(item.recordType), // Convert BigInt to Number
-      }));
+      // 2. Fetch Metadata
+      const uri = await nftContract.tokenURI(searchChipId);
+      const gatewayUrl = resolveIPFS(uri);
+      const response = await fetch(gatewayUrl);
+      const json = await response.json();
 
-      setHistory(formattedHistory.reverse());
-      setActiveTokenId(id);
-    } catch (error) {
-      console.error("Error fetching history:", error);
-      alert("No se pudo obtener el historial. Verifica si el Token ID existe.");
+      setPatientMetadata({
+        name: json.name,
+        image: resolveIPFS(json.image),
+        description: json.description,
+      });
+      setFoundPatientId(searchChipId);
+
+      // 3. Check Deceased Status (Security Check)
+      // We query the last MedicalRecordAdded event. If type is 4, it's deceased.
+      const filter = storageContract.filters.MedicalRecordAdded(searchChipId);
+      const events = await storageContract.queryFilter(filter);
+      if (events.length > 0) {
+        // Sort to get latest
+        const latestEvent: any = events.sort(
+          (a: any, b: any) => Number(b.args[1]) - Number(a.args[1])
+        )[0];
+        if (Number(latestEvent.args[4]) === 4) {
+          // 4 = Deceased
+          setIsDeceased(true);
+        }
+      }
+    } catch (error: any) {
+      console.error(error);
+      alert("Paciente no encontrado. Verifica el ID del Chip.");
     } finally {
-      setLoadingHistory(false);
+      setSearching(false);
     }
   };
 
-  const handleSearch = () => {
-    if (!searchTokenId) return;
-    fetchHistory(searchTokenId);
-  };
-
-  // --- Medical Record Logic ---
+  // --- Logic: Add Record ---
   const handleAddRecord = async () => {
-    if (!nftContract || !activeTokenId) return;
+    if (!nftContract || !foundPatientId) return;
     setIsAdding(true);
     setRecordStatus(null);
     try {
-      // Calls: addMedicalRecord(uint256 _tokenId, string _desc, uint8 _type, uint256 _daysValid)
       const tx = await nftContract.addMedicalRecord(
-        activeTokenId,
+        foundPatientId,
         desc,
         recordType,
         daysValid
       );
-      setRecordStatus(`Procesando Registro: ${tx.hash}...`);
+      setRecordStatus(`Enviando: ${tx.hash}...`);
       await tx.wait();
-      setRecordStatus("¡Historial médico agregado con éxito!");
+      setRecordStatus("¡Historial actualizado correctamente!");
 
-      // Reset Fields
+      // Check if we just marked as deceased
+      if (recordType === 4) setIsDeceased(true);
+
+      // Reset form
       setDesc("");
       setRecordType(0);
       setDaysValid(0);
-      fetchHistory(activeTokenId);
     } catch (error: any) {
       console.error(error);
-      setRecordStatus(
-        `Error: ${
-          error.reason ||
-          error.message ||
-          "Verifica si estás aprobado por el dueño."
-        }`
-      );
+      if (
+        error.message.includes("not approved") ||
+        error.reason?.includes("not approved") ||
+        error.message.includes("ERC721InvalidApprover")
+      ) {
+        setRecordStatus(
+          "⛔ ERROR: No tienes permiso. El dueño debe aprobarte para atender a esta mascota."
+        );
+      } else {
+        setRecordStatus(`Error: ${error.reason || error.message}`);
+      }
     } finally {
       setIsAdding(false);
     }
   };
 
-  // Helper to get badge color based on type
-  const getTypeBadgeStyle = (type: number) => {
-    switch (type) {
-      case 1:
-        return "bg-green-500/20 text-green-300 border-green-500/30"; // Vaccine
-      case 2:
-        return "bg-red-500/20 text-red-300 border-red-500/30"; // Surgery
-      case 3:
-        return "bg-yellow-500/20 text-yellow-300 border-yellow-500/30"; // XRay
-      default:
-        return "bg-blue-500/20 text-blue-300 border-blue-500/30"; // General
-    }
-  };
-
   return (
-    <div className="space-y-12">
-      {/* 1. Register New Patient Section */}
-      <div className="bg-surface p-6 rounded-xl shadow-lg border border-primary/30 relative overflow-hidden">
-        <div className="absolute top-0 right-0 p-4 opacity-10">
-          <span className="text-9xl">🐕</span>
-        </div>
-        <h2 className="text-2xl font-bold mb-6 text-white flex items-center gap-2">
-          <span className="text-primary">✚</span> Registrar Nuevo Paciente
-        </h2>
+    <div className="space-y-6 animate-fade-in pb-12">
+      {/* Back Button */}
+      <button
+        onClick={onBack}
+        className="flex items-center gap-2 text-slate-400 hover:text-white transition-colors"
+      >
+        <span>⬅</span> Volver al Menú
+      </button>
 
-        {regStatus && (
-          <div
-            className={`mb-6 p-4 rounded-lg border ${
-              regStatus.includes("Error")
-                ? "bg-red-500/10 border-red-500/50 text-red-200"
-                : "bg-green-500/10 border-green-500/50 text-green-200"
-            }`}
-          >
-            {regStatus}
-          </div>
-        )}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+        {/* 1. Register Patient Column */}
+        <div className="bg-surface p-6 rounded-xl shadow-lg border border-slate-700 h-fit">
+          <h2 className="text-xl font-bold mb-6 text-white flex items-center gap-2">
+            <span className="text-primary">✚</span> Nuevo Paciente
+          </h2>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-6 items-end">
-          <Input
-            label="Dirección del Dueño (0x...)"
-            placeholder="ej. 0x123..."
-            value={regOwner}
-            onChange={(e) => setRegOwner(e.target.value)}
-          />
-          <Input
-            label="ID de Chip (Token ID)"
-            type="number"
-            placeholder="ej. 1001"
-            value={regChipId}
-            onChange={(e) => setRegChipId(e.target.value)}
-          />
-          <Input
-            label="URI de Metadatos / Nombre"
-            placeholder="ej. ipfs://... o 'Max'"
-            value={regUri}
-            onChange={(e) => setRegUri(e.target.value)}
-          />
-          <Input
-            label="Fecha de Nacimiento"
-            type="date"
-            value={regBirthDate}
-            onChange={(e) => setRegBirthDate(e.target.value)}
-          />
-          <Button
-            onClick={handleRegisterAnimal}
-            isLoading={isRegistering}
-            variant="primary"
-            className="w-full md:col-span-2"
-          >
-            Registrar Paciente y Asignar Dueño
-          </Button>
-        </div>
-      </div>
+          {regStatus && (
+            <div
+              className={`mb-6 p-4 rounded-lg text-sm border ${
+                regStatus.includes("Error")
+                  ? "bg-red-500/10 border-red-500/50 text-red-200"
+                  : "bg-blue-500/10 border-blue-500/50 text-blue-200"
+              }`}
+            >
+              {regStatus}
+            </div>
+          )}
 
-      <hr className="border-slate-700" />
-
-      {/* 2. Medical Records Section */}
-      <div>
-        <h2 className="text-2xl font-bold mb-4 text-white">🏥 Portal Médico</h2>
-
-        {/* Search Bar */}
-        <div className="bg-surface p-6 rounded-xl shadow-lg border border-slate-700 mb-6">
-          <div className="flex gap-4 items-end max-w-lg">
-            <Input
-              label="Buscar Animal por ID de Chip"
-              placeholder="ej. 1001"
-              value={searchTokenId}
-              onChange={(e) => setSearchTokenId(e.target.value)}
+          <div className="space-y-4">
+            <SmartAddressInput
+              label="Dueño (Email o Address)"
+              value={regOwnerInput}
+              onChange={setRegOwnerInput}
+              onAddressResolved={setRegOwnerAddress}
             />
-            <Button onClick={handleSearch} isLoading={loadingHistory}>
-              Buscar Historial
+            <Input
+              label="Chip ID"
+              type="number"
+              value={regChipId}
+              onChange={(e) => setRegChipId(e.target.value)}
+            />
+            <Input
+              label="Nombre"
+              value={regName}
+              onChange={(e) => setRegName(e.target.value)}
+            />
+            <Input
+              label="Fecha de Nacimiento"
+              type="date"
+              value={regBirthDate}
+              onChange={(e) => setRegBirthDate(e.target.value)}
+            />
+            <div className="w-full">
+              <label className="text-xs font-medium text-slate-400 mb-1 block">
+                Foto
+              </label>
+              <input
+                type="file"
+                accept="image/*"
+                className="text-xs text-slate-400 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-xs file:bg-primary file:text-white hover:file:bg-indigo-500 w-full"
+                onChange={(e) => {
+                  if (e.target.files && e.target.files[0])
+                    setRegImageFile(e.target.files[0]);
+                }}
+              />
+            </div>
+            <Button
+              onClick={handleRegisterAnimal}
+              isLoading={isRegistering}
+              disabled={!regOwnerAddress}
+              className="w-full mt-4"
+            >
+              Registrar Mascota
             </Button>
           </div>
         </div>
 
-        {activeTokenId && (
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 animate-fade-in">
-            {/* Add Record Form */}
-            <div className="bg-surface p-6 rounded-xl shadow-lg border border-slate-700 h-fit">
-              <h3 className="text-xl font-bold text-white mb-4">
-                Agregar Entrada para Chip ID:{" "}
-                <span className="text-primary">{activeTokenId}</span>
-              </h3>
+        {/* 2. Search & Treat Column */}
+        <div className="bg-surface p-6 rounded-xl shadow-lg border border-slate-700 min-h-[500px]">
+          <h2 className="text-xl font-bold mb-6 text-white flex items-center gap-2">
+            <span className="text-secondary">🩺</span> Atender Paciente
+          </h2>
 
-              {recordStatus && (
-                <div
-                  className={`mb-4 p-3 rounded text-sm ${
-                    recordStatus.includes("Error")
-                      ? "bg-red-500/20 text-red-200"
-                      : "bg-green-500/20 text-green-200"
+          <div className="flex gap-2 items-end mb-6">
+            <Input
+              label="Buscar ID de Chip"
+              placeholder="ej. 1001"
+              value={searchChipId}
+              onChange={(e) => setSearchChipId(e.target.value)}
+            />
+            <Button
+              onClick={handleSearchPatient}
+              isLoading={searching}
+              variant="secondary"
+              className="mb-[1px]"
+            >
+              Buscar
+            </Button>
+          </div>
+
+          {foundPatientId && patientMetadata && (
+            <div className="animate-fade-in space-y-6">
+              {/* Patient Header */}
+              <div
+                className={`flex gap-4 p-4 rounded-lg border relative overflow-hidden ${
+                  isDeceased
+                    ? "bg-zinc-900 border-zinc-600"
+                    : "bg-slate-900 border-slate-800"
+                }`}
+              >
+                <img
+                  src={patientMetadata.image}
+                  alt="Pet"
+                  className={`w-20 h-20 object-cover rounded-full border-2 ${
+                    isDeceased
+                      ? "border-zinc-500 grayscale"
+                      : "border-slate-600"
                   }`}
-                >
-                  {recordStatus}
-                </div>
-              )}
-
-              <div className="space-y-4">
+                />
                 <div>
-                  <label className="text-sm font-medium text-slate-400 block mb-1">
-                    Descripción Médica
-                  </label>
-                  <textarea
-                    className="w-full bg-slate-800 border border-slate-700 text-white rounded-lg px-4 py-2 focus:ring-2 focus:ring-primary outline-none h-24 resize-none"
-                    placeholder="Diagnóstico, notas de tratamiento, etc."
-                    value={desc}
-                    onChange={(e) => setDesc(e.target.value)}
-                  ></textarea>
+                  <h3 className="text-xl font-bold text-white">
+                    {patientMetadata.name}
+                  </h3>
+                  <span className="text-primary font-mono text-sm">
+                    #{foundPatientId}
+                  </span>
                 </div>
-
-                <div className="grid grid-cols-2 gap-4">
-                  <div>
-                    <label className="text-sm font-medium text-slate-400 block mb-1">
-                      Tipo de Registro
-                    </label>
-                    <select
-                      className="w-full bg-slate-800 border border-slate-700 text-white rounded-lg px-4 py-2 focus:ring-2 focus:ring-primary outline-none"
-                      value={recordType}
-                      onChange={(e) => setRecordType(Number(e.target.value))}
-                    >
-                      <option value={0}>General</option>
-                      <option value={1}>Vacuna 💉</option>
-                      <option value={2}>Cirugía 🏥</option>
-                      <option value={3}>Rayos X 🦴</option>
-                    </select>
+                {isDeceased && (
+                  <div className="absolute top-0 right-0 bg-black text-white text-xs font-bold px-3 py-1 border-b border-l border-zinc-600">
+                    ⚰️ FALLECIDO
                   </div>
-                  <Input
-                    label="Días de Validez"
-                    type="number"
-                    placeholder="ej. 365 (0 si no expira)"
-                    value={daysValid}
-                    onChange={(e) => setDaysValid(Number(e.target.value))}
+                )}
+              </div>
+
+              {/* Medical History */}
+              <div>
+                <h4 className="text-sm font-bold text-slate-400 uppercase mb-2">
+                  Historial Reciente
+                </h4>
+                <div className="max-h-48 overflow-y-auto custom-scrollbar border border-slate-800 rounded-lg bg-slate-900/50">
+                  <MedicalHistoryTable
+                    tokenId={foundPatientId}
+                    storageContract={storageContract}
                   />
                 </div>
+              </div>
 
-                <Button
-                  onClick={handleAddRecord}
-                  isLoading={isAdding}
-                  className="w-full"
-                >
-                  Enviar Registro Médico
-                </Button>
+              {/* Add Record Form */}
+              <div className="border-t border-slate-700 pt-6">
+                <h4 className="text-lg font-bold text-white mb-4">
+                  ✍️ Nuevo Registro
+                </h4>
+
+                {isDeceased ? (
+                  <div className="p-4 bg-red-900/20 border border-red-900/50 rounded-lg text-red-200 text-center">
+                    Este paciente ha fallecido. No se pueden agregar nuevos
+                    registros médicos.
+                  </div>
+                ) : (
+                  <>
+                    {recordStatus && (
+                      <div
+                        className={`mb-4 p-3 rounded text-sm ${
+                          recordStatus.includes("Error") ||
+                          recordStatus.includes("⛔")
+                            ? "bg-red-500/20 text-red-200 border border-red-500/30"
+                            : "bg-green-500/20 text-green-200"
+                        }`}
+                      >
+                        {recordStatus}
+                      </div>
+                    )}
+
+                    <div className="space-y-4">
+                      <div className="grid grid-cols-2 gap-4">
+                        <div>
+                          <label className="text-xs font-medium text-slate-400 block mb-1">
+                            Tipo
+                          </label>
+                          <select
+                            className="w-full bg-slate-800 border border-slate-700 text-white rounded-lg px-3 py-2 text-sm outline-none focus:border-primary"
+                            value={recordType}
+                            onChange={(e) =>
+                              setRecordType(Number(e.target.value))
+                            }
+                          >
+                            <option value={0}>General</option>
+                            <option value={1}>Vacuna</option>
+                            <option value={2}>Cirugía</option>
+                            <option value={3}>Rayos X</option>
+                            <option value={4}>Fallecimiento</option>
+                          </select>
+                        </div>
+                        {recordType === 1 && (
+                          <Input
+                            label="Validez (Días)"
+                            type="number"
+                            value={daysValid}
+                            onChange={(e) =>
+                              setDaysValid(Number(e.target.value))
+                            }
+                          />
+                        )}
+                      </div>
+                      <div>
+                        <label className="text-xs font-medium text-slate-400 block mb-1">
+                          Descripción
+                        </label>
+                        <textarea
+                          className="w-full bg-slate-800 border border-slate-700 text-white rounded-lg px-3 py-2 text-sm outline-none focus:border-primary h-20 resize-none"
+                          placeholder="Diagnóstico..."
+                          value={desc}
+                          onChange={(e) => setDesc(e.target.value)}
+                        ></textarea>
+                      </div>
+                      <Button
+                        onClick={handleAddRecord}
+                        isLoading={isAdding}
+                        className="w-full"
+                      >
+                        Guardar Registro
+                      </Button>
+                    </div>
+                  </>
+                )}
               </div>
             </div>
+          )}
 
-            {/* History View */}
-            <div className="bg-surface p-6 rounded-xl shadow-lg border border-slate-700">
-              <h3 className="text-xl font-bold text-white mb-4">
-                Historial Médico
-              </h3>
-
-              {history.length === 0 ? (
-                <div className="text-slate-400 italic py-8 text-center border-2 border-dashed border-slate-700 rounded-lg">
-                  No se encontraron registros para este animal.
-                </div>
-              ) : (
-                <div className="space-y-4 max-h-[600px] overflow-y-auto pr-2">
-                  {history.map((record, idx) => (
-                    <div
-                      key={idx}
-                      className="bg-slate-900 border-l-4 border-slate-600 p-4 rounded-r-lg shadow-sm hover:bg-slate-800 transition-colors"
-                    >
-                      <div className="flex justify-between items-start mb-2">
-                        <span className="text-xs text-slate-400 font-mono">
-                          {new Date(
-                            Number(record.timestamp) * 1000
-                          ).toLocaleString()}
-                        </span>
-                        <span
-                          className={`text-xs px-2 py-1 rounded font-bold border ${getTypeBadgeStyle(
-                            record.recordType
-                          )}`}
-                        >
-                          {RECORD_TYPES[record.recordType] || "OTRO"}
-                        </span>
-                      </div>
-                      <p className="text-slate-200 text-sm mb-3">
-                        {record.description}
-                      </p>
-                      <div className="text-xs text-slate-500 font-mono truncate bg-black/30 p-1.5 rounded w-fit">
-                        Vet: {record.vetAddress}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
+          {!foundPatientId && !searching && (
+            <div className="text-center py-12 text-slate-500">
+              Busca un paciente para ver su historia o agregar registros.
             </div>
-          </div>
-        )}
+          )}
+        </div>
       </div>
     </div>
   );
